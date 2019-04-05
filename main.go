@@ -74,12 +74,16 @@ func globalSetup(c *cli.Context, g *globalConfig) error {
 	}
 
 	if regions := c.String("regions"); regions != "" {
-		for _, region := range strings.Split(regions, ",") {
-			if !isSupportedRegion(region) {
-				return fmt.Errorf("%s is not supported region", region)
-			}
+		if regions == "all" {
+			g.regions = allEC2Regions
+		} else {
+			for _, region := range strings.Split(regions, ",") {
+				if !isSupportedRegion(region) {
+					return fmt.Errorf("%s is not supported region", region)
+				}
 
-			g.regions = append(g.regions, region)
+				g.regions = append(g.regions, region)
+			}
 		}
 	}
 
@@ -108,7 +112,7 @@ func main() {
 		cli.StringFlag{
 			Name:  "regions, r",
 			Usage: "Target regions (comma separated)",
-			Value: strings.Join(allEC2Regions, ","),
+			Value: "all",
 		},
 	}
 
