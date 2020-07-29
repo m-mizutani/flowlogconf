@@ -2,60 +2,60 @@ package main
 
 import (
 	"errors"
-	"fmt"
 	"os"
 	"strings"
 
 	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 )
 
 var (
 	logger = logrus.New()
 
-	// 2019-04-05
-	// https://docs.aws.amazon.com/ja_jp/general/latest/gr/rande.html#ec2_region
+	// 2020-07-30
+	// https://docs.aws.amazon.com/general/latest/gr/rande.html#ec2_region
 	allEC2Regions = []string{
 		"us-east-2",
 		"us-east-1",
 		"us-west-1",
 		"us-west-2",
+		// "af-south-1", Africa (Cape Town)
+		// "ap-east-1", Asia Pacific (Hong Kong)
 		"ap-south-1",
-		// "ap-northeast-3",
+		// "ap-northeast-3", Asia Pacific (Osaka-Local)
 		"ap-northeast-2",
 		"ap-southeast-1",
 		"ap-southeast-2",
 		"ap-northeast-1",
 		"ca-central-1",
-		// "cn-north-1",
-		// "cn-northwest-1",
+		// "cn-north-1", China (Beijing)
+		// "cn-northwest-1", China (Ningxia)
 		"eu-central-1",
 		"eu-west-1",
 		"eu-west-2",
+		// "eu-south-1", Europe (Milan)
 		"eu-west-3",
-		// "eu-north-1",
+		"eu-north-1",
 		"sa-east-1",
 		// "us-gov-east-1",
 		// "us-gov-west-1",
 	}
 )
 
-func isSupportedRegion(target string) bool {
-	for _, region := range allEC2Regions {
-		if region == target {
-			return true
-		}
+type globalArguments struct {
+	logLevel string
+	regions  string
+}
+
+func (x *globalArguments) Regions() []string {
+	if x.regions == "all" {
+		return allEC2Regions
 	}
-
-	return false
+	return strings.Split(x.regions, ",")
 }
 
-type globalConfig struct {
-	regions []string
-}
-
-func globalSetup(c *cli.Context, g *globalConfig) error {
-	switch c.String("loglevel") {
+func (x *globalArguments) Configure() error {
+	switch x.logLevel {
 	case "trace":
 		logger.SetLevel(logrus.TraceLevel)
 	case "debug":
@@ -69,108 +69,45 @@ func globalSetup(c *cli.Context, g *globalConfig) error {
 	case "":
 		break // ignore
 	default:
-		logger.WithField("loglevel", c.String("loglevel")).Error("invalid log level")
+		logger.WithField("loglevel", x.logLevel).Error("invalid log level")
 		return errors.New("LogLevel must be in [trace|debug|info|warn|error]")
 	}
 
-	if regions := c.String("regions"); regions != "" {
-		if regions == "all" {
-			g.regions = allEC2Regions
-		} else {
-			for _, region := range strings.Split(regions, ",") {
-				if !isSupportedRegion(region) {
-					return fmt.Errorf("%s is not supported region", region)
-				}
-
-				g.regions = append(g.regions, region)
-			}
-		}
-	}
-
-	if parent := c.Parent(); parent != nil {
-		return globalSetup(parent, g)
-	}
 	return nil
 }
 
 func main() {
-	config := globalConfig{}
-	var trafficType string
-	var dryrun bool
+	args := globalArguments{}
 
-	app := cli.NewApp()
-	app.Name = "flowlogconf"
-	app.Version = "v0.1.0"
-	app.Usage = "AWS VPC Flow Logs batch config tool"
-
-	app.Flags = []cli.Flag{
-		cli.StringFlag{
-			Name:  "loglevel, l",
-			Usage: "Set log level [trace|debug|info|warn|error]",
-			Value: "info",
-		},
-		cli.StringFlag{
-			Name:  "regions, r",
-			Usage: "Target regions (comma separated)",
-			Value: "all",
-		},
-	}
-
-	app.Commands = []cli.Command{
-		cli.Command{
-			Name: "show",
-			Action: func(c *cli.Context) error {
-				logger.Info("Show config")
-
-				if err := globalSetup(c, &config); err != nil {
-					return err
-				}
-				if err := showConfigs(config.regions); err != nil {
-					return err
-				}
-
-				return nil
+	app := &cli.App{
+		Name:    "flowlogconf",
+		Version: "v0.2.0",
+		Usage:   "AWS VPC Flow Logs batch config tool!",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:        "loglevel",
+				Aliases:     []string{"l"},
+				Usage:       "Set log level [trace|debug|info|warn|error]",
+				Value:       "info",
+				Destination: &args.logLevel,
+			},
+			&cli.StringFlag{
+				Name:        "regions",
+				Aliases:     []string{"r"},
+				Usage:       "Target regions (comma separated)",
+				Value:       "all",
+				Destination: &args.regions,
 			},
 		},
-		cli.Command{
-			Name: "add",
-			Action: func(c *cli.Context) error {
-				logger.Info("Add config")
-
-				if err := globalSetup(c, &config); err != nil {
-					return err
-				}
-
-				if c.NArg() != 1 {
-					return errors.New("Invalid arguments: add [s3bucket] [traffic type]")
-				}
-
-				s3bucket := c.Args().Get(0)
-
-				if err := addS3Configs(s3bucket, trafficType, config.regions, dryrun); err != nil {
-					return err
-				}
-
-				return nil
-			},
-			Flags: []cli.Flag{
-				cli.StringFlag{
-					Name:        "traffic-type, t",
-					Usage:       "Set traffic type [ACCEPT | REJECT | ALL]",
-					Value:       "ALL",
-					Destination: &trafficType,
-				},
-				cli.BoolFlag{
-					Name:        "dryrun, d",
-					Usage:       "Enable dryrun mode",
-					Destination: &dryrun,
-				},
-			},
+		Commands: []*cli.Command{
+			showCommand(&args),
+			addCommand(&args),
 		},
 	}
 
 	err := app.Run(os.Args)
 	if err != nil {
-		logger.WithError(err).Fatal("Exit with error.")
+		logger.WithError(err).Error("Exit with error.")
+		os.Exit(1)
 	}
 }
