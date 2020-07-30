@@ -1,10 +1,11 @@
 package main
 
 import (
+	"sync"
+
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -14,45 +15,66 @@ type vpcInfo struct {
 	region    string
 }
 
-func getVpcList(regions []string) ([]vpcInfo, error) {
-	var vpcList []vpcInfo
+func getVpcList(regions []string) ([]*vpcInfo, error) {
+	var vpcList []*vpcInfo
+	ch := make(chan *vpcInfo, 4096)
+	done := make(chan bool)
 
-	for _, region := range regions {
-		ssn := session.Must(session.NewSession(&aws.Config{
-			Region: aws.String(region),
-		}))
+	go func() {
+		var wg sync.WaitGroup
+		for _, r := range regions {
+			wg.Add(1)
 
-		svc := ec2.New(ssn)
+			go func(region string) {
+				defer wg.Done()
+				logger.WithField("region", region).Debug("Retrieving VPC info")
 
-		var nextToken string
-		for {
-			input := &ec2.DescribeVpcsInput{}
-			if nextToken != "" {
-				input.NextToken = &nextToken
-			}
+				ssn := session.Must(session.NewSession(&aws.Config{
+					Region: aws.String(region),
+				}))
+				svc := ec2.New(ssn)
 
-			result, err := svc.DescribeVpcs(input)
-			if err != nil {
-				return nil, errors.Wrapf(err, "Fail to fetch VPC descriptions (%s)", region)
-			}
-			logger.WithFields(logrus.Fields{
-				"region":    region,
-				"vpc count": len(result.Vpcs),
-			}).Debug("Got VPC descriptions")
+				var nextToken string
+				for {
+					input := &ec2.DescribeVpcsInput{}
+					if nextToken != "" {
+						input.NextToken = &nextToken
+					}
 
-			for _, vpc := range result.Vpcs {
-				vpcList = append(vpcList, vpcInfo{
-					vpcID:     *vpc.VpcId,
-					cidrBlock: *vpc.CidrBlock,
-					region:    region,
-				})
-			}
+					result, err := svc.DescribeVpcs(input)
+					if err != nil {
+						logger.WithField("region", region).WithError(err).Error("Fail to fetch VPC descriptions")
+						return
+					}
 
-			if result.NextToken == nil {
-				break
-			}
-			nextToken = *result.NextToken
+					logger.WithFields(logrus.Fields{
+						"region":    region,
+						"vpc count": len(result.Vpcs),
+					}).Debug("Got VPC descriptions")
+
+					for _, vpc := range result.Vpcs {
+						ch <- &vpcInfo{
+							vpcID:     *vpc.VpcId,
+							cidrBlock: *vpc.CidrBlock,
+							region:    region,
+						}
+					}
+
+					if result.NextToken == nil {
+						break
+					}
+					nextToken = *result.NextToken
+				}
+			}(r)
 		}
+		wg.Wait()
+		close(ch)
+		done <- true
+	}()
+
+	<-done
+	for vpc := range ch {
+		vpcList = append(vpcList, vpc)
 	}
 
 	return vpcList, nil
@@ -63,70 +85,62 @@ type flowLogConfig struct {
 	region  string
 }
 
-func getFlowLogConfigs(regions []string) ([]flowLogConfig, error) {
-	var configs []flowLogConfig
+func getFlowLogConfigs(regions []string) ([]*flowLogConfig, error) {
+	var configs []*flowLogConfig
+	ch := make(chan *flowLogConfig, 4096)
+	done := make(chan bool)
 
-	for _, region := range regions {
-		ssn := session.Must(session.NewSession(&aws.Config{
-			Region: aws.String(region),
-		}))
+	go func() {
+		var wg sync.WaitGroup
+		for _, r := range regions {
+			wg.Add(1)
 
-		var nextToken string
-		for {
-			svc := ec2.New(ssn)
-			input := &ec2.DescribeFlowLogsInput{}
-			if nextToken != "" {
-				input.NextToken = &nextToken
-			}
+			go func(region string) {
+				defer wg.Done()
+				ssn := session.Must(session.NewSession(&aws.Config{
+					Region: aws.String(region),
+				}))
 
-			result, err := svc.DescribeFlowLogs(input)
-			if err != nil {
-				return nil, errors.Wrapf(err, "Fail to fetch FlowLog descriptions (%s)", region)
-			}
+				var nextToken string
+				for {
+					svc := ec2.New(ssn)
+					input := &ec2.DescribeFlowLogsInput{}
+					if nextToken != "" {
+						input.NextToken = &nextToken
+					}
 
-			logger.WithFields(logrus.Fields{
-				"region":        region,
-				"flowlog count": len(result.FlowLogs),
-			}).Debug("Got FlowLogs")
+					result, err := svc.DescribeFlowLogs(input)
+					if err != nil {
+						logger.WithField("region", region).WithError(err).Error("Fail to fetch FlowLog descriptions")
+						return
+					}
 
-			for _, flowlog := range result.FlowLogs {
-				configs = append(configs, flowLogConfig{flowlog, region})
-			}
+					logger.WithFields(logrus.Fields{
+						"region":        region,
+						"flowlog count": len(result.FlowLogs),
+					}).Debug("Got FlowLogs")
 
-			if result.NextToken == nil {
-				break
-			}
-			nextToken = *result.NextToken
+					for _, flowlog := range result.FlowLogs {
+						ch <- &flowLogConfig{flowlog, region}
+					}
+
+					if result.NextToken == nil {
+						break
+					}
+					nextToken = *result.NextToken
+				}
+			}(r)
 		}
+
+		wg.Wait()
+		close(ch)
+		done <- true
+	}()
+
+	<-done
+	for flowLog := range ch {
+		configs = append(configs, flowLog)
 	}
 
 	return configs, nil
-}
-
-func addFlowLogS3(dstBucket, traffic, resource, region string, vpcIDs []string) error {
-	var resourceIds []*string
-	for _, vpcID := range vpcIDs {
-		resourceIds = append(resourceIds, &vpcID)
-	}
-
-	ssn := session.Must(session.NewSession(&aws.Config{
-		Region: aws.String(region),
-	}))
-	svc := ec2.New(ssn)
-	input := &ec2.CreateFlowLogsInput{
-		LogDestination:     aws.String(dstBucket),
-		LogDestinationType: aws.String("s3"),
-		ResourceIds:        resourceIds,
-		ResourceType:       aws.String(resource),
-		TrafficType:        aws.String(traffic),
-	}
-
-	result, err := svc.CreateFlowLogs(input)
-	if err != nil {
-		return errors.Wrapf(err, "Fail to create FlowLog (%s, %s, %s)", region, dstBucket, vpcIDs)
-	}
-
-	logger.WithField("result", result).Debug("Create FlowLog")
-
-	return nil
 }
